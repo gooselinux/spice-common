@@ -1,0 +1,54 @@
+From a6f859487bcf4b52a618c54f89f88860d0b75e28 Mon Sep 17 00:00:00 2001
+From: Yonit Halperin <yhalperi@redhat.com>
+Date: Wed, 17 Mar 2010 18:43:41 +0200
+Subject: [RHEL-6 spice v2] new migration process #576033
+
+- the server acquires the target info from a dedicated Qemu command
+- when migration ends, the client receieves a new message RED_MIGRATE_SWITCH_HOST
+- client then disconnects from the source and connects to the target. The connection
+  to the target is entirely new.
+---
+ common/red.h           |   13 ++++-
+ 7 files changed, 281 insertions(+), 6 deletions(-)
+
+diff --git a/common/red.h b/common/red.h
+index cead066..44cef46 100644
+--- a/common/red.h
++++ b/common/red.h
+@@ -46,7 +46,7 @@
+ 
+ #define RED_MAGIC (*(uint32_t*)"REDQ")
+ #define RED_VERSION_MAJOR 1
+-#define RED_VERSION_MINOR 1
++#define RED_VERSION_MINOR 2
+ 
+ // Encryption & Ticketing Parameters
+ #define RED_MAX_PASSWORD_LENGTH 60
+@@ -166,6 +166,8 @@ enum {
+     RED_AGENT_DATA,
+     RED_AGENT_TOKEN,
+ 
++    RED_MIGRATE_SWITCH_HOST,
++
+     RED_MESSAGES_END,
+ };
+ 
+@@ -231,6 +233,15 @@ typedef struct ATTR_PACKED RedMigrationBegin {
+     uint32_t pub_key_size;
+ } RedMigrationBegin;
+ 
++typedef struct ATTR_PACKED RedMigrationSwitchHost {
++    uint16_t port;
++    uint16_t sport;
++    uint32_t host_offset;
++    uint32_t host_size;
++    uint32_t cert_subject_offset;
++    uint32_t cert_subject_size;
++} RedMigrationSwitchHost;
++
+ enum {
+     RED_MIGRATE_NEED_FLUSH = (1 << 0),
+     RED_MIGRATE_NEED_DATA_TRANSFER = (1 << 1),
+-- 
+1.6.6.1
+

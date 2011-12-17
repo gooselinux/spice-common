@@ -1,0 +1,288 @@
+From fefe79a58df0a24c06c21783ddd5c09394e3ca12 Mon Sep 17 00:00:00 2001
+From: Izik Eidus <ieidus@redhat.com>
+Date: Sat, 13 Mar 2010 10:40:56 +0200
+Subject: [PATCH] spice server: fix unsafe guest/host data handling #568811
+
+Signed-off-by: Izik Eidus <ieidus@redhat.com>
+---
+ common/cairo_canvas.c |   23 +++++++++++++----------
+ common/cairo_canvas.h |    9 +++++----
+ common/canvas_base.c  |   37 ++++++++++++++++++++++---------------
+ common/canvas_base.h  |    6 ++++++
+ common/gl_canvas.c    |   23 +++++++++++++----------
+ common/gl_canvas.h    |    9 +++++----
+ 6 files changed, 64 insertions(+), 43 deletions(-)
+
+diff --git a/common/cairo_canvas.c b/common/cairo_canvas.c
+index 732df91..e8f177b 100644
+--- a/common/cairo_canvas.c
++++ b/common/cairo_canvas.c
+@@ -1569,18 +1569,10 @@ cairo_t *canvas_get_cairo(CairoCanvas *canvas)
+ }
+
+ #ifdef CAIRO_CANVAS_ACCESS_TEST
+-void canvas_set_access_params(CairoCanvas *canvas, ADDRESS delta, unsigned long base,
+-                              unsigned long max)
++void canvas_set_access_params(CairoCanvas *canvas, unsigned long base, unsigned long max)
+ {
+-    __canvas_set_access_params(&canvas->base, delta, base, max);
++    __canvas_set_access_params(&canvas->base, base, max);
+ }
+-
+-#else
+-void canvas_set_access_params(CairoCanvas *canvas, ADDRESS delta)
+-{
+-    __canvas_set_access_params(&canvas->base, delta);
+-}
+-
+ #endif
+
+ void canvas_destroy(CairoCanvas *canvas)
+@@ -1614,6 +1606,10 @@ CairoCanvas *canvas_create(cairo_t *cairo, int bits
+ #ifdef USE_GLZ
+                             , void *glz_decoder_opaque, glz_decode_fn_t glz_decode
+ #endif
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++                           , void *get_virt_opaque, get_virt_fn_t get_virt,
++                           void *validate_virt_opaque, validate_virt_fn_t validate_virt
++#endif
+                            )
+ {
+     CairoCanvas *canvas;
+@@ -1645,6 +1641,13 @@ CairoCanvas *canvas_create(cairo_t *cairo, int bits
+                                glz_decoder_opaque,
+                                glz_decode
+ #endif
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++                               ,
++                               get_virt_opaque,
++                               get_virt,
++                               validate_virt_opaque,
++                               validate_virt
++#endif
+                                );
+     canvas->cairo = cairo;
+     canvas->private_data = NULL;
+diff --git a/common/cairo_canvas.h b/common/cairo_canvas.h
+index 3d9a930..d144b35 100644
+--- a/common/cairo_canvas.h
++++ b/common/cairo_canvas.h
+@@ -55,10 +55,7 @@ void canvas_group_start(CairoCanvas *canvas, int n_clip_rects, Rect *clip_rects)
+ void canvas_group_end(CairoCanvas *canvas);
+ void canvas_set_addr_delta(CairoCanvas *canvas, ADDRESS delta);
+ #ifdef CAIRO_CANVAS_ACCESS_TEST
+-void canvas_set_access_params(CairoCanvas *canvas, ADDRESS delta, unsigned long base,
+-                              unsigned long max);
+-#else
+-void canvas_set_access_params(CairoCanvas *canvas, ADDRESS delta);
++void canvas_set_access_params(CairoCanvas *canvas, unsigned long base, unsigned long max);
+ #endif
+
+ cairo_t *canvas_get_cairo(CairoCanvas *canvas);
+@@ -78,6 +75,10 @@ CairoCanvas *canvas_create(cairo_t *cairo, int bits
+ #ifdef USE_GLZ
+                            , void *glz_decoder_opaque, glz_decode_fn_t glz_decode
+ #endif
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++                           , void *get_virt_opaque, get_virt_fn_t get_virt,
++                           void *validate_virt_opaque, validate_virt_fn_t validate_virt
++#endif
+                            );
+ void canvas_destroy(CairoCanvas *canvas);
+
+diff --git a/common/canvas_base.c b/common/canvas_base.c
+index a5519ff..4cf9026 100644
+--- a/common/canvas_base.c
++++ b/common/canvas_base.c
+@@ -151,7 +151,10 @@ typedef struct QuicData {
+     jmp_buf jmp_env;
+ #ifndef CAIRO_CANVAS_NO_CHUNKS
+     ADDRESS next;
+-    ADDRESS address_delta;
++    get_virt_fn_t get_virt;
++    void *get_virt_opaque;
++    validate_virt_fn_t validate_virt;
++    void *validate_virt_opaque;
+ #endif
+     char message_buf[512];
+ } QuicData;
+@@ -160,7 +163,6 @@ typedef struct CanvasBase {
+     uint32_t color_shift;
+     uint32_t color_mask;
+     QuicData quic_data;
+-    ADDRESS address_delta;
+ #ifdef CAIRO_CANVAS_ACCESS_TEST
+     unsigned long base;
+     unsigned long max;
+@@ -256,7 +258,6 @@ static cairo_surface_t *canvas_get_quic(CanvasBase *canvas, QUICImage *image, in
+     tmp = (DataChunk **)image->quic.data;
+     chunk = *tmp;
+     quic_data->next = chunk->next;
+-    quic_data->address_delta = canvas->address_delta;
+     if (quic_decode_begin(quic_data->quic, (uint32_t *)chunk->data, chunk->size >> 2,
+                           &type, &width, &height) == QUIC_ERROR) {
+         CANVAS_ERROR("quic decode begin failed");
+@@ -1486,14 +1487,19 @@ static int quic_usr_more_space(QuicUsrContext *usr, uint32_t **io_ptr, int rows_
+ {
+     QuicData *quic_data = (QuicData *)usr;
+     DataChunk *chunk;
++    uint32_t size;
+
+     if (!quic_data->next) {
+         return 0;
+     }
+-    chunk = (DataChunk *)GET_ADDRESS(quic_data->next + quic_data->address_delta);
++    chunk = (DataChunk *)quic_data->get_virt(quic_data->get_virt_opaque, quic_data->next,
++                                             sizeof(DataChunk));
++    size = chunk->size;
++    quic_data->validate_virt(quic_data->validate_virt_opaque, (unsigned long)chunk->data, size);
++
+     quic_data->next = chunk->next;
+     *io_ptr = (uint32_t *)chunk->data;
+-    return chunk->size >> 2;
++    return size >> 2;
+ }
+
+ #endif
+@@ -1504,20 +1510,11 @@ static int quic_usr_more_lines(QuicUsrContext *usr, uint8_t **lines)
+ }
+
+ #ifdef CAIRO_CANVAS_ACCESS_TEST
+-static void __canvas_set_access_params(CanvasBase *canvas, ADDRESS delta, unsigned long base,
+-                                       unsigned long max)
++static void __canvas_set_access_params(CanvasBase *canvas, unsigned long base, unsigned long max)
+ {
+-    canvas->address_delta = delta;
+     canvas->base = base;
+     canvas->max = max;
+ }
+-
+-#else
+-static void __canvas_set_access_params(CanvasBase *canvas, ADDRESS delta)
+-{
+-    canvas->address_delta = delta;
+-}
+-
+ #endif
+
+ static void canvas_base_destroy(CanvasBase *canvas)
+@@ -1551,6 +1548,10 @@ static int canvas_base_init(CanvasBase *canvas, int depth
+ #ifdef USE_GLZ
+                             , void *glz_decoder_opaque, glz_decode_fn_t glz_decode
+ #endif
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++                           , void *get_virt_opaque, get_virt_fn_t get_virt,
++                           void *validate_virt_opaque, validate_virt_fn_t validate_virt
++#endif
+                             )
+ {
+     canvas->quic_data.usr.error = quic_usr_error;
+@@ -1560,6 +1561,12 @@ static int canvas_base_init(CanvasBase *canvas, int depth
+     canvas->quic_data.usr.free = quic_usr_free;
+     canvas->quic_data.usr.more_space = quic_usr_more_space;
+     canvas->quic_data.usr.more_lines = quic_usr_more_lines;
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++    canvas->quic_data.get_virt_opaque = get_virt_opaque;
++    canvas->quic_data.get_virt = get_virt;
++    canvas->quic_data.validate_virt_opaque = validate_virt_opaque;
++    canvas->quic_data.validate_virt = validate_virt;
++#endif
+     if (!(canvas->quic_data.quic = quic_create(&canvas->quic_data.usr))) {
+             return 0;
+     }
+diff --git a/common/canvas_base.h b/common/canvas_base.h
+index 778244f..58a70cc 100644
+--- a/common/canvas_base.h
++++ b/common/canvas_base.h
+@@ -36,5 +36,11 @@ typedef void (*palette_cache_release_fn_t)(Palette *palette);
+ typedef void (*glz_decode_fn_t)(void *glz_decoder_opaque, uint8_t *data,
+                                 Palette *plt, void *usr_data);
+
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++typedef void *(*get_virt_fn_t)(void *get_virt_opaque, unsigned long addr, uint32_t add_size);
++typedef void (*validate_virt_fn_t)(void *validate_virt_opaque, unsigned long virt,
++                                   uint32_t add_size);
++#endif
++
+ #endif
+
+diff --git a/common/gl_canvas.c b/common/gl_canvas.c
+index aac93c9..15722a9 100644
+--- a/common/gl_canvas.c
++++ b/common/gl_canvas.c
+@@ -770,18 +770,10 @@ void gl_canvas_clear_top_mask(GLCanvas *canvas)
+ }
+
+ #ifdef CAIRO_CANVAS_ACCESS_TEST
+-void gl_canvas_set_access_params(GLCanvas *canvas, ADDRESS delta, unsigned long base,
+-                                 unsigned long max)
++void gl_canvas_set_access_params(GLCanvas *canvas, unsigned long base, unsigned long max)
+ {
+-    __canvas_set_access_params(&canvas->base, delta, base, max);
++    __canvas_set_access_params(&canvas->base, base, max);
+ }
+-
+-#else
+-void gl_canvas_set_access_params(GLCanvas *canvas, ADDRESS delta)
+-{
+-    __canvas_set_access_params(&canvas->base, delta);
+-}
+-
+ #endif
+
+ void *gl_canvas_get_usr_data(GLCanvas *canvas)
+@@ -811,6 +803,10 @@ GLCanvas *gl_canvas_create(void *usr_data, int width, int height, int depth
+ #ifdef USE_GLZ
+                            , void *glz_decoder_opaque, glz_decode_fn_t glz_decode
+ #endif
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++                           , void *get_virt_opaque, get_virt_fn_t get_virt,
++                           void *validate_virt_opaque, validate_virt_fn_t validate_virt
++#endif
+                            )
+ {
+     GLCanvas *canvas;
+@@ -848,6 +844,13 @@ GLCanvas *gl_canvas_create(void *usr_data, int width, int height, int depth
+                                glz_decoder_opaque,
+                                glz_decode
+ #endif
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++                               ,
++                               get_virt_opaque,
++                               get_virt,
++                               validate_virt_opaque,
++                               validate_virt
++#endif
+                                );
+     if (!init_ok) {
+         goto error_2;
+diff --git a/common/gl_canvas.h b/common/gl_canvas.h
+index b9a4eb8..2e3dd7c 100644
+--- a/common/gl_canvas.h
++++ b/common/gl_canvas.h
+@@ -48,10 +48,7 @@ void gl_canvas_set_top_mask(GLCanvas *canvas, int num_rect, const Rect *rects);
+ void gl_canvas_clear_top_mask(GLCanvas *canvas);
+
+ #ifdef CAIRO_CANVAS_ACCESS_TEST
+-void gl_canvas_set_access_params(GLCanvas *canvas, ADDRESS delta, unsigned long base,
+-                                 unsigned long max);
+-#else
+-void gl_canvas_set_access_params(GLCanvas *canvas, ADDRESS delta);
++void gl_canvas_set_access_params(GLCanvas *canvas, unsigned long base, unsigned long max);
+ #endif
+
+ void *gl_canvas_get_usr_data(GLCanvas *canvas);
+@@ -76,6 +73,10 @@ GLCanvas *gl_canvas_create(void *usr_data, int width, int height, int depth
+ #ifdef USE_GLZ
+                            , void *glz_decoder_opaque, glz_decode_fn_t glz_decode
+ #endif
++#ifndef CAIRO_CANVAS_NO_CHUNKS
++                           , void *get_virt_opaque, get_virt_fn_t get_virt,
++                           void *validate_virt_opaque, validate_virt_fn_t validate_virt
++#endif
+                            );
+ void gl_canvas_destroy(GLCanvas *, int);
+
+-- 
+1.7.1.1
+
